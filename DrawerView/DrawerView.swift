@@ -127,7 +127,7 @@ private struct ChildScrollViewInfo {
 
     // MARK: - Private properties
 
-    fileprivate var panGestureRecognizer: DrawerViewPanGestureRecognizer!
+    public var panGestureRecognizer: DrawerViewPanGestureRecognizer!
 
     fileprivate var overlayTapRecognizer: UITapGestureRecognizer!
 
