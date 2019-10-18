@@ -54,10 +54,6 @@ fileprivate extension DrawerPosition {
     ]
 }
 
-public class DrawerViewPanGestureRecognizer: UIPanGestureRecognizer {
-
-}
-
 let kVelocityTreshold: CGFloat = 0
 
 // Vertical leeway is used to cover the bottom with springy animations.
@@ -72,6 +68,8 @@ let kDefaultShadowOpacity: Float = 0.05
 let kDefaultBackgroundEffect = UIBlurEffect(style: .extraLight)
 
 let kDefaultBorderColor = UIColor(white: 0.2, alpha: 0.2)
+
+let kOverlayOpacity: CGFloat = 0.5
 
 
 @objc public protocol DrawerViewDelegate {
@@ -93,16 +91,13 @@ private struct ChildScrollViewInfo {
     var gestureRecognizers: [UIGestureRecognizer] = []
 }
 
+
 @IBDesignable public class DrawerView: UIView {
 
     // MARK: - Public types
 
-    public enum VisibilityAnimation {
-        case none
-        case slide
-        //case fadeInOut
-    }
-
+    /// InsetAdjustmentBehavior describes the behavior for inset adjustment. Generally this is used to
+    /// account the safe area of the device.
     public enum InsetAdjustmentBehavior: Equatable {
         /// Evaluate the bottom inset automatically.
         case automatic
@@ -110,7 +105,7 @@ private struct ChildScrollViewInfo {
         case superviewSafeArea
         /// Use a fixed value for bottom inset.
         case fixed(CGFloat)
-        /// Don't use bottom inset.
+        /// No automatic inset adjustment.
         case never
     }
 
@@ -120,46 +115,19 @@ private struct ChildScrollViewInfo {
         /// Same as automatic, but hide only content that is completely below the bottom inset
         case allowPartial
         /// Specify explicit views to hide.
-        case custom([UIView])
+        case custom(() -> [UIView])
         /// Don't use bottom inset.
         case never
     }
 
-    // MARK: - Private properties
-
-    public var panGestureRecognizer: DrawerViewPanGestureRecognizer!
-
-    fileprivate var overlayTapRecognizer: UITapGestureRecognizer!
-
-    private var panOrigin: CGFloat = 0.0
-
-    private var horizontalPanOnly: Bool = true
-
-    private var startedDragging: Bool = false
-
-    private var previousAnimator: UIViewPropertyAnimator? = nil
-
-    private var currentPosition: DrawerPosition = .collapsed
-
-    private var topConstraint: NSLayoutConstraint? = nil
-
-    private var heightConstraint: NSLayoutConstraint? = nil
-
-    fileprivate var childScrollViews: [ChildScrollViewInfo] = []
-
-    private var overlay: Overlay?
-
-    private let borderView = UIView()
-
-    private let backgroundView = UIVisualEffectView(effect: kDefaultBackgroundEffect)
-
-    private var willConceal: Bool = false
-
-    private var orientationChanged: Bool = false
-
-    private var lastWarningDate: Date?
-
-    private let embeddedView: UIView?
+    public enum OverlayVisibilityBehavior {
+        /// Show the overlay only when at the topmost position.
+        case topmostPosition
+        /// Show the overlay when open, either fully or partially.
+        case whenOpen
+        /// Don't show overlay
+        case disabled
+    }
 
     // MARK: - Visual properties
 
@@ -210,6 +178,12 @@ private struct ChildScrollViewInfo {
         }
     }
 
+    public var overlayVisibilityBehavior: OverlayVisibilityBehavior = .topmostPosition {
+        didSet {
+            updateVisuals()
+        }
+    }
+
     public var automaticallyAdjustChildContentInset: Bool = true {
         didSet {
             safeAreaInsetsDidChange()
@@ -222,7 +196,6 @@ private struct ChildScrollViewInfo {
         }
     }
 
-    private var _isConcealed: Bool = false
     public var isConcealed: Bool {
         get {
             return _isConcealed
@@ -234,7 +207,7 @@ private struct ChildScrollViewInfo {
 
     public func setConcealed(_ concealed: Bool, animated: Bool) {
         _isConcealed = concealed
-        updateSnapPosition(animated: animated)
+        setPosition(currentPosition, animated: animated)
     }
 
     public func removeFromSuperview(animated: Bool) {
@@ -251,6 +224,14 @@ private struct ChildScrollViewInfo {
 
     @IBOutlet
     public weak var delegate: DrawerViewDelegate?
+
+    /// The gesture recognizer that will be handling the drawer pan.
+    public lazy var panGestureRecognizer: UIPanGestureRecognizer = {
+        var panGestureRecognizer = UIPanGestureRecognizer(target: self, action: #selector(handlePan))
+        panGestureRecognizer.maximumNumberOfTouches = 2
+        panGestureRecognizer.minimumNumberOfTouches = 1
+        return panGestureRecognizer
+    }()
 
     /// Boolean indicating whether the drawer is enabled. When disabled, all user
     /// interaction with the drawer is disabled. However, user interaction with the
@@ -271,6 +252,15 @@ private struct ChildScrollViewInfo {
         } else {
             return convertScrollPositionToOffset(self.currentSnapPosition)
         }
+    }
+
+    public func visibleHeight(forPosition position: DrawerPosition) -> CGFloat {
+        guard let superview = superview else {
+            return 0
+        }
+
+        let snapPosition = self.snapPosition(for: position, inSuperView: superview)
+        return convertScrollPositionToOffset(snapPosition)
     }
 
     // IB support, not intended to be used otherwise.
@@ -303,7 +293,6 @@ private struct ChildScrollViewInfo {
         }
 
         topConstraint = self.topAnchor.constraint(equalTo: view.topAnchor, constant: self.topMargin)
-        heightConstraint = self.heightAnchor.constraint(equalTo: view.heightAnchor, constant: -self.topSpace)
         heightConstraint = self.heightAnchor.constraint(greaterThanOrEqualTo: view.heightAnchor, multiplier: 1, constant: -self.topSpace)
         let bottomConstraint = self.bottomAnchor.constraint(greaterThanOrEqualTo: view.bottomAnchor)
 
@@ -364,12 +353,51 @@ private struct ChildScrollViewInfo {
                 // Current position is not in the given list, default to the most closed one.
                 self.setInitialPosition()
             }
+            self.heightConstraint?.constant = -self.topSpace
         }
     }
 
     /// An opacity (0 to 1) used for automatically hiding child views. This is made public so that
     /// you can match the opacity with your custom views.
     public private(set) var currentChildOpacity: CGFloat = 1.0
+
+    // MARK: - Private properties
+
+    fileprivate var overlayTapRecognizer: UITapGestureRecognizer!
+
+    private var panOrigin: CGFloat = 0.0
+
+    private var horizontalPanOnly: Bool = true
+
+    private var startedDragging: Bool = false
+
+    private var previousAnimator: UIViewPropertyAnimator? = nil
+
+    private var currentPosition: DrawerPosition = .collapsed
+
+    private var topConstraint: NSLayoutConstraint? = nil
+
+    private var heightConstraint: NSLayoutConstraint? = nil
+
+    fileprivate var childScrollViews: [ChildScrollViewInfo] = []
+
+    private var overlay: Overlay?
+
+    private let borderView = UIView()
+
+    private let backgroundView = UIVisualEffectView(effect: kDefaultBackgroundEffect)
+
+    private var willConceal: Bool = false
+
+    private var _isConcealed: Bool = false
+
+    private var orientationChanged: Bool = false
+
+    private var lastWarningDate: Date?
+
+    private let embeddedView: UIView?
+
+    private var hiddenChildViews: [UIView]?
 
     // MARK: - Initialization
 
@@ -437,9 +465,6 @@ private struct ChildScrollViewInfo {
             object: nil)
         #endif
 
-        panGestureRecognizer = DrawerViewPanGestureRecognizer(target: self, action: #selector(handlePan))
-        panGestureRecognizer.maximumNumberOfTouches = 2
-        panGestureRecognizer.minimumNumberOfTouches = 1
         panGestureRecognizer.delegate = self
         self.addGestureRecognizer(panGestureRecognizer)
 
@@ -611,9 +636,9 @@ private struct ChildScrollViewInfo {
 
         let position: CGFloat
         if let lowerBound = positions.first, dragPoint < lowerBound {
-            position = lowerBound - damp(value: lowerBound - dragPoint, factor: 50)
+            position = lowerBound - damp(value: lowerBound - dragPoint, factor: 20)
         } else if let upperBound = positions.last, dragPoint > upperBound {
-            position = upperBound + damp(value: dragPoint - upperBound, factor: 50)
+            position = upperBound + damp(value: dragPoint - upperBound, factor: 20)
         } else {
             position = dragPoint
         }
@@ -622,7 +647,9 @@ private struct ChildScrollViewInfo {
     }
 
     private func updateSnapPosition(animated: Bool) {
-        self.setPosition(currentPosition, animated: animated)
+        if panGestureRecognizer.state.isTracking == false {
+            self.setPosition(currentPosition, animated: animated)
+        }
     }
 
     private func setScrollPosition(_ scrollPosition: CGFloat, notifyDelegate: Bool) {
@@ -640,14 +667,13 @@ private struct ChildScrollViewInfo {
     }
 
     private func setInitialPosition() {
-        self.position = self.snapPositionsSorted.last ?? .collapsed
+        self.position = self.snapPositionsDescending.last ?? .collapsed
     }
 
     // MARK: - Pan handling
 
     @objc private func handlePan(_ sender: UIPanGestureRecognizer) {
-
-        let isFullyExpanded = self.snapPositionsSorted.last == self.position
+        let isFullyExpanded = self.snapPositionsDescending.last == self.position
 
         switch sender.state {
         case .began:
@@ -662,13 +688,6 @@ private struct ChildScrollViewInfo {
 
             updateScrollPosition(whileDraggingAtPoint: panOrigin, notifyDelegate: true)
 
-            // Disable child scroll if not in an expanded position
-            if !isFullyExpanded {
-                log("Disabled child scrolling")
-                self.childScrollViews.forEach { $0.scrollView.isScrollEnabled = false }
-            }
-
-            break
         case .changed:
 
             let translation = sender.translation(in: self)
@@ -694,7 +713,7 @@ private struct ChildScrollViewInfo {
                 // TODO: Better support for scroll views that don't have directional scroll lock enabled.
                 let ableToDetermineHorizontalPan =
                     simultaneousPanGestures.count > 0 && simultaneousPanGestures
-                        .all { self.ableToDetermineHorizontalPan($0.scrollView) }
+                        .allSatisfy { self.ableToDetermineHorizontalPan($0.scrollView) }
 
                 if simultaneousPanGestures.count > 0 && !ableToDetermineHorizontalPan && shouldWarn(&lastWarningDate) {
                     NSLog("WARNING (DrawerView): One subview of DrawerView has not enabled directional lock. Without directional lock it is ambiguous to determine if DrawerView should start panning.")
@@ -703,7 +722,7 @@ private struct ChildScrollViewInfo {
                 if ableToDetermineHorizontalPan {
                     let panningVertically = simultaneousPanGestures.count > 0
                         && simultaneousPanGestures
-                            .all {
+                            .allSatisfy {
                                 let pan = $0.pan.translation(in: self)
                                 return !(pan.x != 0 && pan.y == 0)
                     }
@@ -816,7 +835,7 @@ private struct ChildScrollViewInfo {
 
                 let nextPosition: DrawerPosition
                 if targetPosition == self.position && abs(velocity.y) > kVelocityTreshold,
-                    let advanced = self.snapPositionsSorted.advance(from: targetPosition, offset: advancement) {
+                    let advanced = self.snapPositionsDescending.advance(from: targetPosition, offset: advancement) {
                     nextPosition = advanced
                 } else {
                     nextPosition = targetPosition
@@ -837,7 +856,7 @@ private struct ChildScrollViewInfo {
     @objc private func onTapOverlay(_ sender: UITapGestureRecognizer) {
         if sender.state == .ended {
 
-            if let prevPosition = self.snapPositionsSorted.advance(from: self.position, offset: -1) {
+            if let prevPosition = self.snapPositionsDescending.advance(from: self.position, offset: -1) {
 
                 self.delegate?.drawer?(self, willTransitionFrom: currentPosition, to: prevPosition)
 
@@ -887,7 +906,7 @@ private struct ChildScrollViewInfo {
         return bottomInset
     }
 
-    private func snapPosition(for position: DrawerPosition, inSuperView superview: UIView) -> CGFloat {
+    fileprivate func snapPosition(for position: DrawerPosition, inSuperView superview: UIView) -> CGFloat {
         switch position {
         case .open:
             return self.topMargin
@@ -902,17 +921,27 @@ private struct ChildScrollViewInfo {
         }
     }
 
-    private func opacityFactor(for position: DrawerPosition) -> CGFloat {
-        switch position {
-        case .open:
+    private func opacityFactor(for position: DrawerPosition) -> CGFloat? {
+        let topmost = (self.topmostPosition ?? .closed).rawValue
+
+        switch (position, overlayVisibilityBehavior) {
+        case (_, .disabled):
+            return nil
+        case (_, .topmostPosition):
+            return (position.rawValue >= topmost) ? 1 : 0
+        case (.open, .whenOpen):
+            fallthrough
+        case (.partiallyOpen, .whenOpen):
             return 1
-        case .partiallyOpen:
+        case (.collapsed, _):
             return 0
-        case .collapsed:
-            return 0
-        case .closed:
+        case (.closed, _):
             return 0
         }
+    }
+
+    private var topmostPosition: DrawerPosition? {
+        return self.snapPositionsDescending.last
     }
 
     private func shadowOpacityFactor(for position: DrawerPosition) -> Float {
@@ -993,6 +1022,7 @@ private struct ChildScrollViewInfo {
         if automaticallyAdjustChildContentInset {
             let bottomInset = self.bottomInset
             self.adjustChildContentInset(self, bottomInset: bottomInset)
+            self.updateSnapPosition(animated: true)
         }
     }
 
@@ -1047,20 +1077,43 @@ private struct ChildScrollViewInfo {
             return
         }
 
+        switch (self.overlayVisibilityBehavior) {
+        case .disabled:
+            return
+        case .topmostPosition:
+            break
+        case .whenOpen:
+            break
+        }
+
         let values = snapPositions(for: DrawerPosition.allPositions, inSuperView: superview)
-            .map {(
-                position: $0.snapPosition,
-                value: self.opacityFactor(for: $0.position)
-                )}
+          .compactMap { pos -> (position: CGFloat, value: CGFloat)? in
+            guard let opacityFactor = self.opacityFactor(for: pos.position) else {
+                return nil
+            }
+            return (
+                position: pos.snapPosition,
+                value: opacityFactor
+            )
+        }
 
-        let opacityFactor = interpolate(
-            values: values,
-            position: position)
+        let opacityFactor: CGFloat
+        if values.count > 0 {
+            opacityFactor = interpolate(
+                values: values,
+                position: position)
+        } else {
+            opacityFactor = 0
+        }
 
-        let maxOpacity: CGFloat = 0.5
+        if opacityFactor > 0 {
+            self.overlay = self.overlay ?? createOverlay()
+            self.overlay?.alpha = opacityFactor * kOverlayOpacity
+        } else {
+            self.overlay?.removeFromSuperview()
+            self.overlay = nil
+        }
 
-        self.overlay = self.overlay ?? createOverlay()
-        self.overlay?.alpha = opacityFactor * maxOpacity
     }
 
     private func setShadowOpacity(forScrollPosition position: CGFloat) {
@@ -1087,17 +1140,30 @@ private struct ChildScrollViewInfo {
             return
         }
 
-        let viewsToHide = self.childViewsToHide()
-        let bottomInset = self.bottomInset
+        // TODO: This method doesn't take into account if a child view opacity was changed while it is hidden.
 
-        if bottomInset > 0 {
+        if self.bottomInset > 0 {
+
             // Measure the distance to collapsed position.
             let snap = self.snapPosition(for: .collapsed, inSuperView: superview)
             let alpha = min(1, (snap - position) / self.bottomInset)
 
-            for childView in viewsToHide {
-                // TODO: respect the original alpha on the child.
-                childView.alpha = alpha
+            if alpha < 1 {
+                // Ask only once when beginning to hide child views.
+                let viewsToHide = self.hiddenChildViews ?? self.childViewsToHide()
+                self.hiddenChildViews = viewsToHide
+
+                viewsToHide.forEach { view in
+                    view.alpha = alpha
+                }
+
+            } else {
+                if let hiddenViews = self.hiddenChildViews {
+                    hiddenViews.forEach { view in
+                        view.alpha = 1
+                    }
+                }
+                self.hiddenChildViews = nil
             }
 
             currentChildOpacity = alpha
@@ -1123,8 +1189,8 @@ private struct ChildScrollViewInfo {
                 $0 !== self.backgroundView && $0 !== self.borderView
                     && (allowPartial ? $0.frame.minY > snap : $0.frame.maxY > snap)
             }
-        case .custom(let views):
-            return views
+        case .custom(let handler):
+            return handler()
         case .never:
             return []
 
@@ -1132,27 +1198,11 @@ private struct ChildScrollViewInfo {
     }
 
     private var topSpace: CGFloat {
-        // Use only the open positions for determining the top space.
-        let topPosition = DrawerPosition.openPositions
-            .sorted(by: compareSnapPositions)
-            .reversed()
-            .first(where: self.snapPositions.contains)
-            ?? .open
+        let topPosition = self.snapPositions
+            .sortedBySnap(in: self, ascending: true)
+            .first?.snap
 
-        return superview.map { self.snapPosition(for: topPosition, inSuperView: $0) } ?? 0
-    }
-
-    fileprivate var snapPositionsSorted: [DrawerPosition] {
-        return self.snapPositions.sorted(by: compareSnapPositions)
-    }
-
-    private func compareSnapPositions(first: DrawerPosition, second: DrawerPosition) -> Bool {
-        if let superview = superview {
-            return snapPosition(for: first, inSuperView: superview) > snapPosition(for: second, inSuperView: superview)
-        } else {
-            // Fall back to comparison between the enumerations.
-            return first.rawValue > second.rawValue
-        }
+        return topPosition ?? 0
     }
 
     private var currentSnapPosition: CGFloat {
@@ -1167,11 +1217,7 @@ private struct ChildScrollViewInfo {
         return superview.bounds.height - position
     }
 
-    private func damp(value: CGFloat, factor: CGFloat) -> CGFloat {
-        return factor * (log10(value + factor/log(10)) - log10(factor/log(10)))
-    }
-
-    func ableToDetermineHorizontalPan(_ scrollView: UIScrollView) -> Bool {
+    private func ableToDetermineHorizontalPan(_ scrollView: UIScrollView) -> Bool {
         let hasDirectionalLock = (scrollView is UITableView) || scrollView.isDirectionalLockEnabled
         // If vertical scroll is not possible, or directional lock is
         // enabled, we are able to detect if view was panned horizontally.
@@ -1190,6 +1236,8 @@ private struct ChildScrollViewInfo {
     }
 }
 
+// MARK: - Extensions
+
 extension DrawerView: UIGestureRecognizerDelegate {
 
     override public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
@@ -1204,7 +1252,7 @@ extension DrawerView: UIGestureRecognizerDelegate {
         if gestureRecognizer === self.panGestureRecognizer {
             if let scrollView = otherGestureRecognizer.view as? UIScrollView {
 
-                if let index = self.childScrollViews.index(where: { $0.scrollView === scrollView }) {
+                if let index = self.childScrollViews.firstIndex(where: { $0.scrollView === scrollView }) {
                     // Existing scroll view, update it.
                     let scrollInfo = self.childScrollViews[index]
                     self.childScrollViews[index].gestureRecognizers = scrollInfo.gestureRecognizers + [otherGestureRecognizer]
@@ -1238,17 +1286,26 @@ extension DrawerView: UIGestureRecognizerDelegate {
             }
         }
 
-        return true
+        return false
     }
 
 }
+
+// MARK: - Private Extensions
 
 public extension DrawerView {
 
-    func getPosition(offsetBy offset: Int) -> DrawerPosition? {
-        return self.snapPositionsSorted.advance(from: self.position, offset: offset)
+    var snapPositionsDescending: [DrawerPosition] {
+        return self.snapPositions
+            .sortedBySnap(in: self, ascending: false)
+            .map { $0.position }
+    }
+
+    func getNextPosition(offsetBy offset: Int) -> DrawerPosition? {
+        return snapPositionsDescending.advance(from: self.position, offset: offset)
     }
 }
+
 
 fileprivate extension CGRect {
 
@@ -1270,7 +1327,7 @@ public extension BidirectionalCollection where Element == DrawerPosition {
             return nil
         }
 
-        if let index = self.index(of: position) {
+        if let index = self.firstIndex(of: position) {
             let nextIndex = self.index(index, offsetBy: offset)
             return self.indices.contains(nextIndex) ? self[nextIndex] : nil
         } else {
@@ -1280,10 +1337,20 @@ public extension BidirectionalCollection where Element == DrawerPosition {
 
 }
 
-fileprivate extension Collection {
+fileprivate extension Collection where Element == DrawerPosition {
 
-    func all(_ predicate: (Element) throws -> Bool) rethrows -> Bool {
-        return try !self.contains(where: { try !predicate($0) })
+    func sortedBySnap(in drawerView: DrawerView, ascending: Bool) -> [(position: DrawerPosition, snap: CGFloat)] {
+        guard let superview = drawerView.superview else {
+            return []
+        }
+
+        return self
+            .map { ($0, drawerView.snapPosition(for: $0, inSuperView: superview))}
+            .sorted(by: {
+                ascending
+                    ? $0.snap < $1.snap
+                    : $0.snap > $1.snap
+            })
     }
 }
 
@@ -1295,12 +1362,22 @@ fileprivate extension UIGestureRecognizer {
 }
 
 fileprivate extension UIScrollView {
+
     var canScrollVertically: Bool {
         return self.contentSize.height > self.bounds.height
     }
 }
+
+fileprivate extension UIGestureRecognizer.State {
+
+    var isTracking: Bool {
+        return self == .began || self == .changed
+    }
+}
+
 #if !swift(>=4.2)
-extension Array {
+fileprivate extension Array {
+
     // Backwards support for compactMap.
     public func compactMap<ElementOfResult>(_ transform: (Element) throws -> ElementOfResult?) rethrows -> [ElementOfResult] {
         return try self.flatMap(transform)
@@ -1308,13 +1385,20 @@ extension Array {
 }
 #endif
 
-func abort(reason: String) -> Never  {
+// MARK: - Private functions
+
+fileprivate func damp(value: CGFloat, factor: CGFloat) -> CGFloat {
+    return factor * (log10(value + factor/log(10)) - log10(factor/log(10)))
+}
+
+fileprivate func abort(reason: String) -> Never  {
     NSLog("DrawerView: \(reason)")
     abort()
 }
 
-func log(_ message: String) {
+fileprivate func log(_ message: String) {
     if LOGGING {
         print("\(dateFormatter.string(from: Date())): \(message)")
     }
 }
+

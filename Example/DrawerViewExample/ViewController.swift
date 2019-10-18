@@ -9,6 +9,7 @@
 import UIKit
 import MapKit
 import DrawerView
+import WebKit
 
 typealias DrawerMapEntry = (key: String, drawer: DrawerView?)
 
@@ -25,6 +26,8 @@ class ViewController: UIViewController {
     @IBOutlet weak var topPanel: UIStackView!
 
     @IBOutlet weak var locateButtonContainer: UIView!
+
+    private var items: [Int] = Array(0...15)
 
     var drawers: [DrawerMapEntry] = []
 
@@ -78,7 +81,7 @@ class ViewController: UIViewController {
                 another.setConcealed(true, animated: animated)
             } else if another.isConcealed {
                 another.setConcealed(false, animated: animated)
-            }  else if let nextPosition = another.getPosition(offsetBy: 1) ?? another.getPosition(offsetBy: -1) {
+            }  else if let nextPosition = another.getNextPosition(offsetBy: 1) ?? another.getNextPosition(offsetBy: -1) {
                 another.setPosition(nextPosition, animated: animated)
             }
         }
@@ -89,13 +92,14 @@ class ViewController: UIViewController {
         drawerView.insetAdjustmentBehavior = .automatic
         drawerView.delegate = self
         drawerView.position = .collapsed
+
         return drawerView
     }
 
     private func setupDrawers() {
         let toggles = drawers
             .map { (key, value) -> UIButton in
-                let button = UIButton(type: UIButtonType.system)
+                let button = UIButton(type: UIButton.ButtonType.system)
                 button.addTarget(self, action: #selector(toggleTapped(sender:)), for: .touchUpInside)
                 button.setTitle("\(key)", for: .normal)
                 button.setTitleColor(UIColor(red: 0, green: 0.5, blue: 0.8, alpha: 0.7), for: .normal)
@@ -130,6 +134,17 @@ class ViewController: UIViewController {
         drawerView.delegate = self
         drawerView.snapPositions = [.closed, .open]
         drawerView.insetAdjustmentBehavior = .automatic
+
+        let wwdc = "https://developer.apple.com/videos/play/wwdc2019/239/"
+        let request = URLRequest(url: URL(string: wwdc)!)
+
+        let webview = WKWebView()
+        webview.load(request)
+        webview.frame = drawerView.bounds
+        webview.translatesAutoresizingMaskIntoConstraints = false
+        drawerView.addSubview(webview)
+        webview.autoPinEdgesToSuperview()
+
         return drawerView
     }
 
@@ -206,12 +221,12 @@ extension ViewController: UITableViewDataSource {
     }
 
     func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int {
-        return 25
+        return items.count
     }
 
     func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
         let cell = tableView.dequeueReusableCell(withIdentifier: "Cell") ?? UITableViewCell(style: .default, reuseIdentifier: "Cell")
-        cell.textLabel?.text = "Cell \(indexPath.row)"
+        cell.textLabel?.text = "Cell \(items[indexPath.row])"
         cell.backgroundColor = UIColor.clear
         return cell
     }
@@ -223,6 +238,13 @@ extension ViewController: UITableViewDelegate {
         tableView.deselectRow(at: indexPath, animated: true)
         drawerView?.setPosition(.collapsed, animated: true)
         //drawers[3].drawer?.setPosition(.partiallyOpen, animated: true)
+    }
+
+    func tableView(_ tableView: UITableView, commit editingStyle: UITableViewCell.EditingStyle, forRowAt indexPath: IndexPath) {
+        if editingStyle == .delete {
+            items.remove(at: indexPath.row)
+            tableView.deleteRows(at: [indexPath], with: .fade)
+        }
     }
 }
 
